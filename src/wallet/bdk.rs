@@ -3,22 +3,49 @@
 //! Currently, wallet synchronization is exclusively performed through RPC for makers.
 //! In the future, takers might adopt alternative synchronization methods, such as lightweight wallet solutions.
 
+use bdk_chain::{
+    bitcoin::{
+        secp256k1::{All, Secp256k1 as bdk_Secp256k1},
+        Network as BdkNetwork,
+    },
+    keychain::KeychainTxOutIndex,
+    local_chain::LocalChain,
+    ConfirmationTimeHeightAnchor, IndexedTxGraph,
+};
+use bdk_persist::{Persist, PersistBackend};
+use bdk_wallet::{
+    bitcoin::blockdata::constants::genesis_block,
+    descriptor::{
+        checksum::calc_checksum_bytes, DescriptorError, ExtendedDescriptor, IntoWalletDescriptor,
+    },
+    keys::{
+        any_network, mainnet_network, test_networks, DescriptorKey, IntoDescriptorKey, KeyError,
+    },
+    miniscript::{
+        descriptor::{DescriptorType, DescriptorXKey, KeyMap, Wildcard},
+        miniscript::ScriptContext,
+        Descriptor, DescriptorPublicKey, ForEachKey, MiniscriptKey, TranslatePk,
+    },
+    signer::{SignerOrdering, SignersContainer, TransactionSigner},
+};
+use std::fmt::Debug;
+
+use bitcoin::{secp256k1::Secp256k1, Network};
 use std::{
+    collections::{HashMap, HashSet},
     convert::TryFrom,
-    fs,
     fs::OpenOptions,
     io::{BufReader, BufWriter},
+    iter,
+    num::ParseIntError,
     path::PathBuf,
     str::FromStr,
+    sync::Arc,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
-use std::{
-    collections::{HashMap, HashSet},
-    iter,
-    num::ParseIntError,
-};
+use strum::IntoEnumIterator;
+use strum_macros::EnumIter;
 
 use bdk::descriptor::calc_checksum;
 use bitcoin::{
@@ -31,11 +58,11 @@ use bitcoin::{
     secp256k1,
     secp256k1::{
         rand::{rngs::OsRng, RngCore},
-        KeyPair, Message, Secp256k1, SecretKey,
+        KeyPair, Message, SecretKey,
     },
     sighash::{EcdsaSighashType, SighashCache},
-    Address, Amount, Network, OutPoint, PublicKey, Script, ScriptBuf, Sequence, Transaction, TxIn,
-    TxOut, Txid, Witness,
+    Address, Amount, OutPoint, PublicKey, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+    Txid, Witness,
 };
 
 use bitcoind::bitcoincore_rpc::{
@@ -45,9 +72,8 @@ use bitcoind::bitcoincore_rpc::{
 
 use crate::{
     protocol::{
-        contract,
         contract::{
-            apply_two_signatures_to_2of2_multisig_spend, create_multisig_redeemscript,
+            self, apply_two_signatures_to_2of2_multisig_spend, create_multisig_redeemscript,
             read_contract_locktime, read_hashlock_pubkey_from_contract,
             read_hashvalue_from_contract, read_pubkeys_from_multisig_redeemscript,
             read_timelock_pubkey_from_contract, sign_contract_tx, verify_contract_tx_sig,
@@ -66,22 +92,28 @@ use serde_json::{json, Value};
 
 use bip39::Mnemonic;
 
+use bdk_wallet::wallet::{LoadError, NewError};
+
 // these subroutines are coded so that as much as possible they keep all their
 // data in the bitcoin core wallet
 // for example which privkey corresponds to a scriptpubkey is stored in hd paths
 
 const HARDENDED_DERIVATION: &str = "m/84'/1'/0'";
 
-/// Represents a Bitcoin wallet with associated functionality and data.
 pub struct Wallet {
-    pub(crate) rpc: Client,
-    wallet_file_path: PathBuf,
-    pub(crate) store: WalletStore,
+    signers: HashMap<KeychainKind, Arc<SignersContainer>>,
+    chain: LocalChain,
+    indexed_graph: IndexedTxGraph<ConfirmationTimeHeightAnchor, KeychainTxOutIndex<KeychainKind>>,
+    persist: Persist<ChangeSet>,
+    store: WalletStore,
+    network: Network,
+    secp: SecpCtx,
+    rpc: Client,
 }
 
 /// Speicfy the keychain derivation path from [`HARDENDED_DERIVATION`]
 /// Each kind represents an unhardened index value. Starting with External = 0.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, EnumIter)]
 pub enum KeychainKind {
     External,
     Internal,
@@ -103,6 +135,33 @@ impl KeychainKind {
 }
 
 const WATCH_ONLY_SWAPCOIN_LABEL: &str = "watchonly_swapcoin_label";
+
+/// The changes made to a wallet by applying an [`Update`].
+// TODO: Currently this type is directly copied from BDK  for now->
+// but check that whether these `keychainkind` & `Anchor trait impl` are good to go with.
+pub type ChangeSet = bdk_persist::CombinedChangeSet<KeychainKind, ConfirmationTimeHeightAnchor>;
+
+pub(crate) type SecpCtx = bdk_Secp256k1<All>;
+
+fn convert_bitcoin_to_bdk_network(network: bitcoin::Network) -> BdkNetwork {
+    match network {
+        Network::Bitcoin => BdkNetwork::Bitcoin,
+        Network::Testnet => BdkNetwork::Testnet,
+        Network::Signet => BdkNetwork::Signet,
+        Network::Regtest => BdkNetwork::Regtest,
+        _ => todo!(),
+    }
+}
+
+fn convert_bdk_to_bitcoin_network(network: BdkNetwork) -> Network {
+    match network {
+        BdkNetwork::Bitcoin => Network::Bitcoin,
+        BdkNetwork::Testnet => Network::Testnet,
+        BdkNetwork::Signet => Network::Signet,
+        BdkNetwork::Regtest => Network::Regtest,
+        _ => todo!(),
+    }
+}
 
 /// Enum representing different types of addresses to display.
 #[derive(Clone, PartialEq, Debug)]
@@ -182,7 +241,7 @@ type SwapCoinsInfo<'a> = (
 );
 
 impl Wallet {
-    /// Displays addresses based on the specified `DisplayAddressType`.
+    // Displays addresses based on the specified `DisplayAddressType`.
     pub fn display_addresses(&self, types: DisplayAddressType) -> Result<(), WalletError> {
         if types == DisplayAddressType::All || types == DisplayAddressType::MasterKey {
             println!(
@@ -220,7 +279,7 @@ impl Wallet {
                             .unwrap()
                             .public_key,
                     };
-                    let addr = Address::p2wpkh(&pubkey, self.store.network).unwrap();
+                    let addr = Address::p2wpkh(&pubkey, self.network).unwrap();
                     println!("{} from seed {}/{}/{}", addr, HARDENDED_DERIVATION, c, i);
                 }
             }
@@ -237,7 +296,7 @@ impl Wallet {
             for (multisig_redeemscript, swapcoin) in &self.store.incoming_swapcoins {
                 println!(
                     "{} incoming_swapcoin other_privkey={} contract_txid={}",
-                    Address::p2wsh(multisig_redeemscript, self.store.network),
+                    Address::p2wsh(multisig_redeemscript, self.network),
                     if swapcoin.other_privkey.is_some() {
                         "known  "
                     } else {
@@ -259,7 +318,7 @@ impl Wallet {
             for (multisig_redeemscript, swapcoin) in &self.store.outgoing_swapcoins {
                 println!(
                     "{} outgoing_swapcoin contract_txid={}",
-                    Address::p2wsh(multisig_redeemscript, self.store.network),
+                    Address::p2wsh(multisig_redeemscript, self.network),
                     swapcoin.contract_tx.txid()
                 );
             }
@@ -276,7 +335,7 @@ impl Wallet {
             for swapcoin in self.store.incoming_swapcoins.values() {
                 println!(
                     "{} incoming_swapcoin_contract hashvalue={} locktime={} contract_txid={}",
-                    Address::p2wsh(&swapcoin.contract_redeemscript, self.store.network),
+                    Address::p2wsh(&swapcoin.contract_redeemscript, self.network),
                     swapcoin.get_hashvalue(),
                     swapcoin.get_timelock(),
                     swapcoin.contract_tx.txid()
@@ -295,7 +354,7 @@ impl Wallet {
             for swapcoin in self.store.outgoing_swapcoins.values() {
                 println!(
                     "{} outgoing_swapcoin_contract hashvalue={} locktime={} contract_txid={}",
-                    Address::p2wsh(&swapcoin.contract_redeemscript, self.store.network),
+                    Address::p2wsh(&swapcoin.contract_redeemscript, self.network),
                     swapcoin.get_hashvalue(),
                     swapcoin.get_timelock(),
                     swapcoin.contract_tx.txid()
@@ -308,7 +367,7 @@ impl Wallet {
                 let locktime = bond.lock_time;
                 println!(
                     "[{}] locktime={}",
-                    Address::from_script(&bond.script_pub_key(), self.store.network).unwrap(),
+                    Address::from_script(&bond.script_pub_key(), self.network).unwrap(),
                     locktime
                 );
             }
@@ -316,69 +375,197 @@ impl Wallet {
         Ok(())
     }
 
-    pub fn init(
+    pub fn init<E: IntoWalletDescriptor + Hash + Debug>(
         path: &PathBuf,
-        rpc_config: &RPCConfig,
         seedphrase: String,
         passphrase: String,
-    ) -> Result<Self, WalletError> {
+        network: Network,
+        external_descriptor: E,
+        internal_descriptor: E,
+        fidelity_descriptor: E,
+        swapcoin_descriptor: E,
+        contract_descriptor: E,
+        rpc_config: &RPCConfig,
+        wallet_birthday: Option<u64>,
+    ) -> Result<Self, NewError> {
+        let bdk_network = convert_bitcoin_to_bdk_network(network);
+
         let file_name = path
             .file_name()
             .expect("file name expected")
             .to_str()
             .expect("expected")
             .to_string();
-        let rpc = Client::try_from(rpc_config)?;
-        let wallet_birthday = rpc.get_block_count()?;
         let store = WalletStore::init(
             file_name,
             path,
-            rpc_config.network,
+            network,
             seedphrase,
             passphrase,
-            Some(wallet_birthday),
-        )?;
-        Ok(Self {
-            rpc,
-            wallet_file_path: path.clone(),
+            wallet_birthday,
+        )
+        .expect("failed to initialise the walletstore");
+
+        let genesis_hash = genesis_block(bdk_network).block_hash();
+
+        let secp = bdk_Secp256k1::new();
+        let (chain, chain_changeset) = LocalChain::from_genesis_hash(genesis_hash);
+        let mut index = KeychainTxOutIndex::<KeychainKind>::default();
+
+        let signers = Wallet::create_signers(
+            &mut index,
+            &secp,
+            external_descriptor,
+            internal_descriptor,
+            fidelity_descriptor,
+            swapcoin_descriptor,
+            contract_descriptor,
+            network,
+        )
+        .map_err(NewError::Descriptor)?;
+        let indexed_graph = IndexedTxGraph::new(index);
+
+        let mut persist = Persist::new(());
+        persist.stage(ChangeSet {
+            chain: chain_changeset,
+            indexed_tx_graph: indexed_graph.initial_changeset(),
+            network: Some(bdk_network),
+        });
+        persist.commit().map_err(NewError::Persist)?;
+
+        let rpc = Client::try_from(rpc_config).expect("Failed to load Client from rpc config");
+
+        Ok(Wallet {
+            signers,
+            chain,
+            indexed_graph,
+            persist,
             store,
+            network,
+            secp,
+            rpc,
         })
     }
 
-    /// Load wallet data from file and connects to a core RPC.
-    /// The core rpc wallet name, and wallet_id field in the file should match.
-    pub fn load(rpc_config: &RPCConfig, path: &PathBuf) -> Result<Wallet, WalletError> {
-        let store = WalletStore::read_from_disk(path)?;
-        if rpc_config.wallet_name != store.file_name {
-            return Err(WalletError::Protocol(format!(
-                "Wallet name of database file and core missmatch, expected {}, found {}",
-                rpc_config.wallet_name, store.file_name
-            )));
-        }
-        let rpc = Client::try_from(rpc_config)?;
-        log::info!(
-            "Loaded wallet file {} | External Index = {} | Incoming Swapcoins = {} | Outgoing Swapcoins = {}",
-            store.file_name,
-            store.external_index,
-            store.incoming_swapcoins.len(),
-            store.outgoing_swapcoins.len()
-        );
-        let wallet = Self {
-            rpc,
-            wallet_file_path: path.clone(),
+    fn load_from_changeset(
+        store: WalletStore,
+        changeset: ChangeSet,
+        rpc_config: &RPCConfig,
+    ) -> Result<Self, LoadError> {
+        let secp = bdk_Secp256k1::new();
+        let bdk_network = changeset.network.ok_or(LoadError::MissingNetwork)?;
+        let network = convert_bdk_to_bitcoin_network(bdk_network);
+        let chain =
+            LocalChain::from_changeset(changeset.chain).map_err(|_| LoadError::MissingGenesis)?;
+        let mut index = KeychainTxOutIndex::<KeychainKind>::default();
+
+        let mut all_descriptors = Vec::with_capacity(5);
+
+        changeset
+            .indexed_tx_graph
+            .indexer
+            .keychains_added
+            .clone()
+            .into_iter()
+            .for_each(|(kind, descriptor)| all_descriptors[kind.index_num() as usize] = descriptor);
+
+        // create the signer mapping
+        let signers = Wallet::create_signers(
+            &mut index,
+            &secp,
+            all_descriptors[0].clone(),
+            all_descriptors[1].clone(),
+            all_descriptors[2].clone(),
+            all_descriptors[3].clone(),
+            all_descriptors[4].clone(),
+            network,
+        )
+        .expect("Can't fail: we passed in valid descriptors, recovered from the changeset");
+
+        let mut indexed_graph = IndexedTxGraph::new(index);
+        indexed_graph.apply_changeset(changeset.indexed_tx_graph);
+
+        let persist = Persist::new(());
+
+        // load rpc
+        let rpc = Client::try_from(rpc_config)
+            .expect("Wallet name of database file and core missmatch, expected {}, found {}");
+
+        Ok(Wallet {
+            signers,
+            chain,
+            indexed_graph,
+            persist,
             store,
-        };
+            network,
+            secp,
+            rpc,
+        })
+    }
+
+    /// Load [`Wallet`] from the given persistence backend
+    /// It also adds the private keys of the passed-in descriptors to the [`Wallet`].
+    ///
+    /// Note
+    ///
+    /// This function adds private keys from each kind of descriptor, except Swapcoin.
+    /// The Swapcoin descriptor "wsh(sorted_multi(Xpub1, Xpub2))" contains no private keys.
+
+    pub fn load<E: IntoWalletDescriptor>(
+        path: &PathBuf,
+        rpc_config: &RPCConfig,
+        external_descriptor: E,
+        internal_descriptor: E,
+        fidelity_descriptor: E,
+        contract_descriptor: E,
+        network: Network,
+    ) -> Result<Self, LoadError> {
+        let store =
+            WalletStore::read_from_disk(path).expect("failed to read walletstore from given path");
+
+        let changeset = store
+            .load_from_persistence()
+            .map_err(LoadError::Persist)?
+            .ok_or(LoadError::NotInitialized)?;
+
+        let wallet = Self::load_from_changeset(store, changeset, rpc_config)?;
+
+        // add signers part manually
+        let descriptors = [
+            external_descriptor,
+            internal_descriptor,
+            fidelity_descriptor,
+            contract_descriptor,
+        ];
+
+        let non_swapcoin_kinds = KeychainKind::iter().filter(|kind| match kind {
+            KeychainKind::SwapCoin { .. } => false,
+            _ => true,
+        });
+
+        // Note:
+        //
+        // The swapcoin descriptor (wsh(sortedmulti(2, public_key2, public_key1))) is not included
+        // when adding secret keys to the wallet, as it contains no secret keys.
+
+        for desc in descriptors {
+            let (descriptor, descriptor_keymap) = desc
+                .into_wallet_descriptor(&wallet.secp, convert_bitcoin_to_bdk_network(network))
+                .map_err(|err| LoadError::Descriptor(err))?;
+            if !descriptor_keymap.is_empty() {
+                let signer_container =
+                    SignersContainer::build(descriptor_keymap, &descriptor, &wallet.secp);
+                signer_container
+                    .signers()
+                    .into_iter()
+                    .zip(non_swapcoin_kinds)
+                    .for_each(|(signer, keychain)| {
+                        wallet.add_signer(keychain, SignerOrdering::default(), signer.clone())
+                    });
+            }
+        }
+
         Ok(wallet)
-    }
-
-    /// Deletes the wallet file and returns the result as `Ok(())` on success.
-    pub fn delete_wallet_file(&self) -> Result<(), WalletError> {
-        Ok(fs::remove_file(&self.wallet_file_path)?)
-    }
-
-    /// Returns a reference to the file path of the wallet.
-    pub fn get_file_path(&self) -> &PathBuf {
-        &self.wallet_file_path
     }
 
     /// Update external index and saves to disk.
@@ -386,10 +573,6 @@ impl Wallet {
         self.store.external_index = new_external_index;
         self.save_to_disk()
     }
-
-    // pub fn get_external_index(&self) -> u32 {
-    //     self.external_index
-    // }
 
     /// Update the existing file. Error if path does not exist.
     pub fn save_to_disk(&self) -> Result<(), WalletError> {
@@ -1489,6 +1672,110 @@ impl Wallet {
     }
 }
 
+//___________________WALLET/DESCRIPTOR______________________________________________________________
+
+/// Wrapper for `IntoWalletDescriptor` that performs additional checks on the keys contained in the
+/// descriptor
+pub(crate) fn into_wallet_descriptor_checked<T: IntoWalletDescriptor>(
+    inner: T,
+    secp: &SecpCtx,
+    network: Network,
+) -> Result<(ExtendedDescriptor, KeyMap), DescriptorError> {
+    let (descriptor, keymap) =
+        inner.into_wallet_descriptor(secp, convert_bitcoin_to_bdk_network(network))?;
+
+    // Ensure the keys don't contain any hardened derivation steps or hardened wildcards
+    let descriptor_contains_hardened_steps = descriptor.for_any_key(|k| {
+        if let DescriptorPublicKey::XPub(DescriptorXKey {
+            derivation_path,
+            wildcard,
+            ..
+        }) = k
+        {
+            return *wildcard == Wildcard::Hardened
+                || derivation_path
+                    .into_iter()
+                    .any(bdk_wallet::bitcoin::bip32::ChildNumber::is_hardened);
+        }
+
+        false
+    });
+    if descriptor_contains_hardened_steps {
+        return Err(DescriptorError::HardenedDerivationXpub);
+    }
+
+    if descriptor.is_multipath() {
+        return Err(DescriptorError::MultiPath);
+    }
+
+    // Run miniscript's sanity check, which will look for duplicated keys and other potential
+    // issues
+    descriptor.sanity_check()?;
+
+    Ok((descriptor, keymap))
+}
+
+//_____________________________________WALLET/SIGNER______________________________________________
+impl Wallet {
+    fn create_signers<E: IntoWalletDescriptor>(
+        index: &mut KeychainTxOutIndex<KeychainKind>,
+        secp: &SecpCtx,
+        external_descriptor: E,
+        internal_descriptor: E,
+        fidelity_descriptor: E,
+        swapcoin_descriptor: E,
+        contract_descriptor: E,
+        network: Network,
+    ) -> Result<HashMap<KeychainKind, Arc<SignersContainer>>, DescriptorError> {
+        let descriptors = [
+            external_descriptor,
+            internal_descriptor,
+            fidelity_descriptor,
+            swapcoin_descriptor,
+            contract_descriptor,
+        ];
+        let a = &external_descriptor;
+        let mut signers_map: HashMap<KeychainKind, Arc<SignersContainer>> = HashMap::new();
+
+        for (desc, kind) in descriptors.into_iter().zip(KeychainKind::iter()) {
+            let (desc, keymap) = into_wallet_descriptor_checked(desc, secp, network)?;
+            let signers = Arc::new(SignersContainer::build(keymap, &desc, &secp));
+            let _ = index.insert_descriptor(kind, desc);
+            signers_map.insert(kind, signers);
+        }
+
+        Ok(signers_map)
+    }
+
+    pub fn get_signers(&self, keychain: KeychainKind) -> Arc<SignersContainer> {
+        Arc::clone(self.signers.get(&keychain).expect("must not fail"))
+    }
+
+    pub fn add_signer(
+        &mut self,
+        keychain: KeychainKind,
+        ordering: SignerOrdering,
+        signer: Arc<dyn TransactionSigner>,
+    ) {
+        let signer_container = Arc::make_mut(self.signers.get_mut(&keychain).expect("must exist"));
+
+        signer_container.add_external(signer.id(&self.secp), ordering, signer);
+    }
+
+    /// function which will add a new pair in signers field in Wallet struct
+    /// used for swapcoin.
+    fn insert_signer_pair(
+        &mut self,
+        descriptor: ExtendedDescriptor,
+        keymap: KeyMap,
+        keychain: KeychainKind,
+        secp: SecpCtx,
+    ) {
+        let signer_container = Arc::new(SignersContainer::build(keymap, &descriptor, &secp));
+        self.signers.insert(keychain, signer_container);
+    }
+}
+
 //______________________WALLET/FUNDING.rs_______________________________________________________
 
 #[derive(Debug)]
@@ -2209,7 +2496,7 @@ impl Wallet {
             next_index,
             Address::p2wsh(
                 fidelity_redeemscript(&locktime, &fidelity_pubkey).as_script(),
-                self.store.network,
+                self.network,
             ),
             fidelity_pubkey,
         ))
@@ -3602,9 +3889,8 @@ impl Wallet {
                 //so a.network is always testnet even if the address is signet
                 let testnet_signet_type = (a.network == Network::Testnet
                     || a.network == Network::Signet)
-                    && (self.store.network == Network::Testnet
-                        || self.store.network == Network::Signet);
-                if a.network != self.store.network && !testnet_signet_type {
+                    && (self.network == Network::Testnet || self.network == Network::Signet);
+                if a.network != self.network && !testnet_signet_type {
                     return Err(WalletError::Protocol(
                         "Wrong address type in destinations.".to_string(),
                     ));
