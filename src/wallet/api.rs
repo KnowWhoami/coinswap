@@ -275,6 +275,7 @@ impl Wallet {
         Ok(())
     }
 
+    
     pub fn init(
         path: &PathBuf,
         rpc_config: &RPCConfig,
