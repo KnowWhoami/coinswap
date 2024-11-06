@@ -213,7 +213,7 @@ fn setup_fidelity_bond(maker: &Arc<Maker>, maker_address: &str) -> Result<(), Ma
 
         // Set 300 blocks locktime for test
         let locktime = if cfg!(feature = "integration-test") {
-            LockTime::from_height(current_height + 100).map_err(WalletError::Locktime)?
+            LockTime::from_height(current_height + 300).map_err(WalletError::Locktime)?
         } else {
             LockTime::from_height(maker.config.fidelity_timelock + current_height)
                 .map_err(WalletError::Locktime)?
@@ -248,7 +248,7 @@ fn setup_fidelity_bond(maker: &Arc<Maker>, maker_address: &str) -> Result<(), Ma
                         let amount = required - available;
                         let addr = maker.get_wallet().write()?.get_next_external_address()?;
 
-                        log::info!("Send at least {:?} BTC to {:?} | If you send extra, that will be added to your swap balance", amount, addr);
+                        log::info!("Send at least {:.8} BTC to {:?} | If you send extra, that will be added to your swap balance", amount, addr);
 
                         let total_sleep = sleep_increment * sleep_multiplier.min(10 * 60);
                         log::info!("Next sync in {:?} secs", total_sleep);
@@ -490,7 +490,7 @@ pub fn start_maker_server(maker: Arc<Maker>) -> Result<(), MakerError> {
 
         // Block client connections if accepting_client=false
         if !*accepting_clients.lock()? {
-            log::warn!(
+            log::debug!(
                 "[{}] Temporary failure in backend node. Not accepting swap request. Check your node if this error persists",
                 maker.config.port
             );

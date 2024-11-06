@@ -47,6 +47,7 @@ pub enum FidelityError {
     WrongScriptType,
     BondDoesNotExist,
     BondAlreadySpent,
+    BondLocktimeExpired,
     CertExpired,
     General(String),
 }
@@ -263,7 +264,14 @@ impl Wallet {
                     (info.height, info.time as u64)
                 };
                 // Estimated locktime from block height = [current-time + (maturity-height - block-count) * 10 * 60] sec
-                tip_time + ((blocks.to_consensus_u32() as u64 - tip_height as u64) * 10 * 60)
+                let height_diff =
+                    if let Some(x) = blocks.to_consensus_u32().checked_sub(tip_height as u32) {
+                        x as u64
+                    } else {
+                        return Err(FidelityError::BondLocktimeExpired.into());
+                    };
+
+                tip_time + (height_diff * 10 * 60)
             }
             LockTime::Seconds(sec) => sec.to_consensus_u32() as u64,
         };
