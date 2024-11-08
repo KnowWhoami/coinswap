@@ -476,24 +476,20 @@ impl Wallet {
 
         let conf_height = loop {
             sleep_multiplier += 1;
-            if let Ok(get_tx_result) = self.rpc.get_transaction(&txid, None) {
-                if let Some(ht) = get_tx_result.info.blockheight {
-                    log::info!("Fidelity Bond confirmed at blockheight: {}", ht);
-                    break ht;
-                } else {
-                    log::info!(
-                        "Fildelity Transaction {} seen in mempool, waiting for confirmation.",
-                        txid
-                    );
 
-                    let total_sleep = sleep_increment * sleep_multiplier.min(10 * 60);
-                    log::info!("Next sync in {:?} secs", total_sleep);
-                    thread::sleep(Duration::from_secs(total_sleep));
-                    continue;
-                }
+            let get_tx_result = self.rpc.get_transaction(&txid, None)?;
+            if let Some(ht) = get_tx_result.info.blockheight {
+                log::info!("Fidelity Bond confirmed at blockheight: {}", ht);
+                break ht;
             } else {
-                log::info!("Waiting for {} in mempool", txid);
-                continue;
+                log::info!(
+                    "Redeem Fildelity Transaction {} seen in mempool, waiting for confirmation.",
+                    txid
+                );
+
+                let total_sleep = sleep_increment * sleep_multiplier.min(10 * 60); // Caps at 1 Block interval i.e 10 mins
+                log::info!("Next sync in {:?} secs", total_sleep);
+                thread::sleep(Duration::from_secs(total_sleep));
             }
         };
 

@@ -78,7 +78,7 @@ fn test_fidelity() {
         let bond_value = wallet_read
             .calculate_bond_value(highest_bond_index)
             .unwrap();
-        assert_eq!(bond_value, Amount::from_sat(1960));
+        assert_eq!(bond_value, Amount::from_sat(542));
 
         let (bond, _, is_spent) = wallet_read
             .get_fidelity_bonds()
@@ -100,7 +100,7 @@ fn test_fidelity() {
             .unwrap()
             .create_fidelity(
                 Amount::from_sat(8000000),
-                LockTime::from_height((test_framework.get_block_count() as u32) + 300).unwrap(),
+                LockTime::from_height((test_framework.get_block_count() as u32) + 150).unwrap(),
             )
             .unwrap();
 
@@ -111,7 +111,7 @@ fn test_fidelity() {
         assert_eq!(highest_bond_index, index);
 
         let bond_value = wallet_read.calculate_bond_value(index).unwrap();
-        assert_eq!(bond_value, Amount::from_sat(4231));
+        assert_eq!(bond_value, Amount::from_sat(1317));
 
         let (bond, _, is_spent) = wallet_read.get_fidelity_bonds().get(&index).unwrap();
         assert_eq!(bond.amount, Amount::from_sat(8000000));

@@ -211,9 +211,9 @@ fn setup_fidelity_bond(maker: &Arc<Maker>, maker_address: &str) -> Result<(), Ma
             .get_block_count()
             .map_err(WalletError::Rpc)? as u32;
 
-        // Set 300 blocks locktime for test
+        // Set 150 blocks locktime for test
         let locktime = if cfg!(feature = "integration-test") {
-            LockTime::from_height(current_height + 300).map_err(WalletError::Locktime)?
+            LockTime::from_height(current_height + 150).map_err(WalletError::Locktime)?
         } else {
             LockTime::from_height(maker.config.fidelity_timelock + current_height)
                 .map_err(WalletError::Locktime)?
