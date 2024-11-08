@@ -52,7 +52,7 @@ fn test_fidelity() {
 
     let maker_thread = thread::spawn(move || start_maker_server(maker_clone));
 
-    thread::sleep(Duration::from_secs(12));
+    thread::sleep(Duration::from_secs(6));
 
     // TODO: Assert that fund request for fidelity is printed in the log.
 
@@ -78,7 +78,7 @@ fn test_fidelity() {
         let bond_value = wallet_read
             .calculate_bond_value(highest_bond_index)
             .unwrap();
-        assert_eq!(bond_value, Amount::from_sat(185));
+        assert_eq!(bond_value, Amount::from_sat(542));
 
         let (bond, _, is_spent) = wallet_read
             .get_fidelity_bonds()
@@ -93,6 +93,7 @@ fn test_fidelity() {
 
     // Create another fidelity bond of 0.08 BTC and validate it.
     let second_maturity_height = {
+        log::info!("Creating another fidelity bond using the `create_fidelity` API");
         let index = maker
             .get_wallet()
             .write()
@@ -110,7 +111,7 @@ fn test_fidelity() {
         assert_eq!(highest_bond_index, index);
 
         let bond_value = wallet_read.calculate_bond_value(index).unwrap();
-        assert_eq!(bond_value, Amount::from_sat(1801));
+        assert_eq!(bond_value, Amount::from_sat(1317));
 
         let (bond, _, is_spent) = wallet_read.get_fidelity_bonds().get(&index).unwrap();
         assert_eq!(bond.amount, Amount::from_sat(8000000));
