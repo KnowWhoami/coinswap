@@ -23,7 +23,10 @@ use bitcoind::bitcoincore_rpc::RpcApi;
 #[cfg(feature = "tor")]
 use socks::Socks5Stream;
 
-pub(crate) use super::{api::RPC_PING_INTERVAL, Maker};
+pub(crate) use super::{
+    api::{FIDELITY_CHECK_INTERVAL_SECS, RPC_PING_INTERVAL_SECS},
+    Maker,
+};
 
 use crate::{
     error::NetError,
@@ -35,7 +38,7 @@ use crate::{
         handlers::handle_message,
         rpc::start_rpc_server,
     },
-    protocol::messages::{DnsMetadata, DnsRequest, TakerToMakerMessage},
+    protocol::messages::{DnsMetadata, DnsRequest, FidelityProof, TakerToMakerMessage},
     utill::{get_tor_hostname, read_message, send_message, ConnectionType, HEART_BEAT_INTERVAL},
     wallet::WalletError,
 };
@@ -45,8 +48,8 @@ use crate::utill::monitor_log_for_completion;
 
 use crate::maker::error::MakerError;
 
-// Default values for Maker configurations
-pub(crate) const DIRECTORY_SERVERS_REFRESH_INTERVAL_SECS: u64 = 60 * 15; // 15 minutes
+/// TODO: WRite about it.
+pub(crate) const DIRECTORY_SERVERS_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 10); // 1 Block Interval
 
 /// Fetches the Maker and DNS address, and sends maker address to the DNS server.
 /// Depending upon ConnectionType and test/prod environment, different maker address and DNS addresses are returned.
@@ -54,7 +57,7 @@ pub(crate) const DIRECTORY_SERVERS_REFRESH_INTERVAL_SECS: u64 = 60 * 15; // 15 m
 ///
 /// Tor thread is spawned only if ConnectionType=TOR and --feature=tor is enabled.
 /// Errors if ConncetionType=TOR but, the tor feature is not enabled.
-fn network_bootstrap(maker: Arc<Maker>) -> Result<Option<Child>, MakerError> {
+fn network_bootstrap(maker: Arc<Maker>) -> Result<(Option<Child>, String, String), MakerError> {
     let maker_port = maker.config.network_port;
     let (maker_address, dns_address, tor_handle) = match maker.config.connection_type {
         ConnectionType::CLEARNET => {
@@ -129,27 +132,32 @@ fn network_bootstrap(maker: Arc<Maker>) -> Result<Option<Child>, MakerError> {
         }
     };
 
-    log::info!(
-        "[{}] Server is listening at {}",
-        maker.config.network_port,
-        maker_address
-    );
+    Ok((tor_handle, maker_address, dns_address))
+}
 
-    setup_fidelity_bond(&maker, &maker_address)?;
+/// Manages the maker's fidelity bonds and ensures the DNS server is updated with the latest bond proof and maker address.
+///
+/// It performs the following operations:
+/// 1. Redeems all expired fidelity bonds in the maker's wallet, if any are found.
+/// 2. Creates a new fidelity bond if no valid bonds remain after redemption.
+/// 3. Sends a POST request to the DNS server containing the maker's address and the proof of the fidelity bond
+///    with the highest value.
+fn manage_fidelity_bonds_and_update_dns(
+    maker: &Maker,
+    maker_address: &str,
+    dns_address: &str,
+) -> Result<(), MakerError> {
+    maker.wallet.write()?.redeem_expired_fidelity_bonds()?;
+
+    let proof = setup_fidelity_bond(&maker, maker_address)?.unwrap(); // TODO: Handle None case more gracefully if needed.
+
     log::info!(
         "Max offer size : {} sats",
         maker.get_wallet().read()?.store.offer_maxsize
     );
 
-    let proof = maker
-        .highest_fidelity_proof
-        .read()?
-        .as_ref()
-        .unwrap()
-        .clone();
-
     let dns_metadata = DnsMetadata {
-        url: maker_address.clone(),
+        url: maker_address.to_string(),
         proof,
     };
 
@@ -157,70 +165,60 @@ fn network_bootstrap(maker: Arc<Maker>) -> Result<Option<Child>, MakerError> {
         metadata: dns_metadata,
     };
 
-    thread::spawn(move || {
-        let trigger_count = DIRECTORY_SERVERS_REFRESH_INTERVAL_SECS / HEART_BEAT_INTERVAL.as_secs();
-        let mut i = 0;
+    let port = maker.config.network_port;
 
-        while !maker.shutdown.load(Relaxed) {
-            if i >= trigger_count || i == 0 {
-                let stream = match maker.config.connection_type {
-                    ConnectionType::CLEARNET => TcpStream::connect(&dns_address),
-                    #[cfg(feature = "tor")]
-                    ConnectionType::TOR => Socks5Stream::connect(
-                        format!("127.0.0.1:{}", maker.config.socks_port),
-                        dns_address.as_str(),
-                    )
-                    .map(|stream| stream.into_inner()),
-                };
+    log::info!("[{}] Connecting to DNS: {}", port, dns_address);
 
-                log::info!(
-                    "[{}] Connecting to DNS: {}",
-                    maker.config.network_port,
-                    dns_address
-                );
+    while !maker.shutdown.load(Relaxed) {
+        let stream = match maker.config.connection_type {
+            ConnectionType::CLEARNET => TcpStream::connect(dns_address),
+            #[cfg(feature = "tor")]
+            ConnectionType::TOR => Socks5Stream::connect(
+                format!("127.0.0.1:{}", maker.config.socks_port),
+                dns_address,
+            )
+            .map(|s| s.into_inner()),
+        };
 
-                let mut stream = match stream {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!(
-                            "[{}] TCP connection error with directory, reattempting: {}",
-                            maker_port,
-                            e
-                        );
-                        thread::sleep(HEART_BEAT_INTERVAL);
-                        continue;
-                    }
-                };
-
-                if let Err(e) = send_message(&mut stream, &request) {
-                    log::warn!(
-                        "[{}] Failed to send our address to directory, reattempting: {}",
-                        maker_port,
-                        e
+        match stream {
+            Ok(mut stream) => match send_message(&mut stream, &request) {
+                Ok(_) => {
+                    log::info!(
+                        "[{}] Successfully sent our address to DNS at {}",
+                        port,
+                        dns_address
                     );
-                    thread::sleep(HEART_BEAT_INTERVAL);
-                    continue;
+                    break;
                 }
+                Err(e) => log::warn!(
+                    "[{}] Failed to send our address to DNS server, retrying: {}",
+                    port,
+                    e
+                ),
+            },
 
-                log::info!(
-                    "[{}] Successfully sent our address to DNS at {}",
-                    maker_port,
-                    dns_address
-                );
-                // Reset counter when success
-                i = 0;
-            }
-            i += 1;
-            thread::sleep(HEART_BEAT_INTERVAL);
+            Err(e) => log::warn!(
+                "[{}] Failed to establish TCP connection with DNS server, retrying: {}",
+                port,
+                e
+            ),
         }
-    });
 
-    Ok(tor_handle)
+        // Wait for the configured interval before reattempting.
+        thread::sleep(HEART_BEAT_INTERVAL);
+    }
+
+    Ok(())
 }
 
 /// Checks if the wallet already has fidelity bonds. if not, create the first fidelity bond.
-fn setup_fidelity_bond(maker: &Arc<Maker>, maker_address: &str) -> Result<(), MakerError> {
+fn setup_fidelity_bond(
+    maker: &Maker,
+    maker_address: &str,
+) -> Result<Option<FidelityProof>, MakerError> {
     let highest_index = maker.get_wallet().read()?.get_highest_fidelity_index()?;
+    let mut proof = maker.highest_fidelity_proof.write()?;
+
     if let Some(i) = highest_index {
         let wallet_read = maker.get_wallet().read()?;
         let (bond, _, _) = wallet_read.get_fidelity_bonds().get(&i).unwrap();
@@ -243,14 +241,9 @@ fn setup_fidelity_bond(maker: &Arc<Maker>, maker_address: &str) -> Result<(), Ma
             bond.lock_time.to_consensus_u32() - current_height,
             wallet_read.calculate_bond_value(i)?.to_sat()
         );
-        log::info!("Bond amount : {:?}", bond.amount.to_sat());
-        // TODO: work remainig
-        // log::info!("")
 
-        let mut proof = maker.highest_fidelity_proof.write()?;
         *proof = Some(highest_proof);
     } else {
-        // xxxxx
         // No bond in the wallet. Lets attempt to create one.
         let amount = Amount::from_sat(maker.config.fidelity_amount);
         let current_height = maker
@@ -277,7 +270,6 @@ fn setup_fidelity_bond(maker: &Arc<Maker>, maker_address: &str) -> Result<(), Ma
             "Fidelity timelock {} blocks",
             maker.config.fidelity_timelock
         );
-
         while !maker.shutdown.load(Relaxed) {
             sleep_multiplier += 1;
             // sync the wallet
@@ -324,7 +316,7 @@ fn setup_fidelity_bond(maker: &Arc<Maker>, maker_address: &str) -> Result<(), Ma
                         .get_wallet()
                         .read()?
                         .generate_fidelity_proof(i, maker_address)?;
-                    let mut proof = maker.highest_fidelity_proof.write()?;
+
                     *proof = Some(highest_proof);
 
                     // sync and save the wallet data to disk
@@ -334,56 +326,39 @@ fn setup_fidelity_bond(maker: &Arc<Maker>, maker_address: &str) -> Result<(), Ma
                 }
             }
         }
-    }
-    Ok(())
+    };
+
+    Ok(proof.clone())
 }
 
 /// Keep checking if the Bitcoin Core RPC connection is live. Sets the global `accepting_client` flag as per RPC connection status.
 ///
 /// This will not block. Once Core RPC connection is live, accepting_client will set as `true` again.
-fn check_connection_with_core(
-    maker: Arc<Maker>,
-    accepting_clients: Arc<AtomicBool>,
-) -> Result<(), MakerError> {
-    let mut rpc_ping_success = false;
-    let mut i = 0;
-    while !maker.shutdown.load(Relaxed) {
-        // If connection is disrupted keep trying at heart_beat_interval (3 sec).
-        // If connection is live, keep tring at rpc_ping_interval (60 sec).
-        let trigger_count = match rpc_ping_success {
-            true => RPC_PING_INTERVAL.as_secs() / HEART_BEAT_INTERVAL.as_secs(),
-            false => 1,
-        };
-
-        if i >= trigger_count || i == 0 {
-            if let Err(e) = maker.wallet.read()?.rpc.get_blockchain_info() {
-                log::error!(
-                    "[{}] RPC Connection failed. Reattempting {}",
-                    maker.config.network_port,
-                    e
-                );
-                rpc_ping_success = false;
-            } else {
-                if !rpc_ping_success {
-                    log::info!(
-                        "[{}] Bitcoin Core RPC connection is back online.",
-                        maker.config.network_port
-                    );
-                }
-                rpc_ping_success = true;
-            }
-            accepting_clients.store(rpc_ping_success, Relaxed);
-            i = 0;
+fn check_connection_with_core(maker: &Maker) -> Result<(), MakerError> {
+    loop {
+        if let Err(e) = maker.wallet.read()?.rpc.get_blockchain_info() {
+            log::error!(
+                "[{}] RPC Connection failed. Reattempting {}",
+                maker.config.network_port,
+                e
+            );
+        } else {
+            break;
         }
-        i += 1;
+
         thread::sleep(HEART_BEAT_INTERVAL);
     }
+
+    log::info!(
+        "[{}] Bitcoin Core RPC connection is back online.",
+        maker.config.network_port
+    );
 
     Ok(())
 }
 
 /// Handle a single client connection.
-fn handle_client(maker: Arc<Maker>, stream: &mut TcpStream) -> Result<(), MakerError> {
+fn handle_client(maker: &Arc<Maker>, stream: &mut TcpStream) -> Result<(), MakerError> {
     stream.set_nonblocking(false)?; // Block this thread until message is read.
 
     let mut connection_state = ConnectionState::default();
@@ -409,7 +384,7 @@ fn handle_client(maker: Arc<Maker>, stream: &mut TcpStream) -> Result<(), MakerE
         let taker_msg: TakerToMakerMessage = serde_cbor::from_slice(&taker_msg_bytes)?;
         log::info!("[{}]  <=== {}", maker.config.network_port, taker_msg);
 
-        let reply = handle_message(&maker, &mut connection_state, taker_msg);
+        let reply = handle_message(maker, &mut connection_state, taker_msg);
 
         match reply {
             Ok(reply) => {
@@ -475,33 +450,14 @@ pub fn start_maker_server(maker: Arc<Maker>) -> Result<(), MakerError> {
     log::info!("[{}] Currency Network: {}", port, network);
     log::info!("[{}] Total Wallet Balance: {}", port, balance);
 
-    let _tor_thread = network_bootstrap(maker.clone())?;
+    let (_tor_thread, maker_address, dns_address) = network_bootstrap(maker.clone())?;
 
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, maker.config.network_port))
         .map_err(NetError::IO)?;
     listener.set_nonblocking(true)?; // Needed to not block a thread waiting for incoming connection.
 
-    // Global server Mutex, to switch on/off p2p network.
-    let accepting_clients = Arc::new(AtomicBool::new(false));
-
     if !maker.shutdown.load(Relaxed) {
-        // 1. Bitcoin Core Connection checker thread.
-        // Ensures that Bitcoin Core connection is live.
-        // If not, it will block p2p connections until Core works again.
-        let maker_clone = maker.clone();
-        let acc_client_clone = accepting_clients.clone();
-        let conn_check_thread = thread::Builder::new()
-            .name("Bitcoin Core Connection Checker Thread".to_string())
-            .spawn(move || {
-                log::info!("[{}] Spawning Bitcoin Core connection checker thread", port);
-                if let Err(e) = check_connection_with_core(maker_clone.clone(), acc_client_clone) {
-                    log::error!("[{}] Bitcoin Core connection check failed: {:?}", port, e);
-                    maker_clone.shutdown.store(true, Relaxed);
-                }
-            })?;
-        maker.thread_pool.add_thread(conn_check_thread);
-
-        // 2. Idle Client connection checker thread.
+        // 1. Idle Client connection checker thread.
         // This threads check idelness of peer in live swaps.
         // And takes recovery measure if the peer seems to have disappeared in middlle of a swap.
         let maker_clone = maker.clone();
@@ -519,7 +475,7 @@ pub fn start_maker_server(maker: Arc<Maker>) -> Result<(), MakerError> {
             })?;
         maker.thread_pool.add_thread(idle_conn_check_thread);
 
-        // 3. Watchtower thread.
+        // 2. Watchtower thread.
         // This thread checks for broadcasted contract transactions, which usually means violation of the protocol.
         // When contract transaction detected in mempool it will attempt recovery.
         // This can get triggered even when contracts of adjacent hops are published. Implying the whole swap route is disrupted.
@@ -535,7 +491,7 @@ pub fn start_maker_server(maker: Arc<Maker>) -> Result<(), MakerError> {
             })?;
         maker.thread_pool.add_thread(contract_watcher_thread);
 
-        // 4: The RPC server thread.
+        // 3: The RPC server thread.
         // User for responding back to `maker-cli` apps.
         let maker_clone = maker.clone();
         let rpc_thread = thread::Builder::new()
@@ -569,44 +525,42 @@ pub fn start_maker_server(maker: Arc<Maker>) -> Result<(), MakerError> {
     // The P2P Client connection loop.
     // Each client connection will spawn a new handler thread, which is added back in the global thread_pool.
     // This loop beats at `maker.config.heart_beat_interval_secs`
+    let mut wait_time = 0;
     while !maker.shutdown.load(Relaxed) {
-        let maker = maker.clone(); // This clone is needed to avoid moving the Arc<Maker> in each iterations.
+        if wait_time % RPC_PING_INTERVAL_SECS == 0 {
+            if let Err(e) = check_connection_with_core(maker.as_ref()) {
+                log::error!("[{}] Bitcoin Core connection check failed: {:?}", port, e);
+                maker.shutdown.store(true, Relaxed);
+            }
+        }
 
-        // Block client connections if accepting_client=false
-        if !accepting_clients.load(Relaxed) {
-            log::warn!(
-                "[{}] Temporary failure in Bitcoin Core RPC.",
-                maker.config.network_port
-            );
-            sleep(HEART_BEAT_INTERVAL);
-            continue;
+        if wait_time % FIDELITY_CHECK_INTERVAL_SECS == 0 {
+            if let Err(e) =
+                manage_fidelity_bonds_and_update_dns(maker.as_ref(), &maker_address, &dns_address)
+            {
+                log::error!("[{}] Failed to either manage fidelity bonds or sending POST request to DNS: {:?}",port,e);
+                maker.shutdown.store(true, Relaxed);
+            }
+            wait_time = 6;
         }
 
         match listener.accept() {
             Ok((mut stream, _)) => {
-                log::info!(
-                    "[{}] Received incoming connection",
-                    maker.config.network_port
-                );
+                log::info!("[{}] Received incoming connection", port);
 
-                if let Err(e) = handle_client(maker, &mut stream) {
+                if let Err(e) = handle_client(&maker, &mut stream) {
                     log::error!("[{}] Error Handling client request {:?}", port, e);
                 }
             }
 
             Err(e) => {
-                if e.kind() == ErrorKind::WouldBlock {
-                    // Do nothing
-                } else {
-                    log::error!(
-                        "[{}] Error accepting incoming connection: {:?}",
-                        maker.config.network_port,
-                        e
-                    );
+                if e.kind() != ErrorKind::WouldBlock {
+                    log::error!("[{}] Error accepting incoming connection: {:?}", port, e);
                 }
             }
-        };
+        }
 
+        wait_time += HEART_BEAT_INTERVAL.as_secs() as u32;
         sleep(HEART_BEAT_INTERVAL);
     }
 
