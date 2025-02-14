@@ -322,24 +322,22 @@ impl Wallet {
     /// Calculates the total balances of different categories in the wallet.
     /// Includes regular, swap, contract, fidelitly and spendable (regular + swap) utxos.
     /// Optionally takes in a list of UTXOs to reduce rpc call. If None is provided, the full list is fetched from core rpc.
-    pub fn get_balances(
-        &self,
-        all_utxos: Option<&Vec<ListUnspentResultEntry>>,
-    ) -> Result<Balances, WalletError> {
+    pub fn get_balances(&self) -> Result<Balances, WalletError> {
+        // TODO: THink do we require all_utxos parameter for each of the spend_info api of each utxo type?
         let regular = self
-            .list_descriptor_utxo_spend_info(all_utxos)?
+            .list_descriptor_utxo_spend_info(None)?
             .iter()
             .fold(Amount::ZERO, |sum, (utxo, _)| sum + utxo.amount);
         let contract = self
-            .list_live_timelock_contract_spend_info(all_utxos)?
+            .list_live_timelock_contract_spend_info(None)?
             .iter()
             .fold(Amount::ZERO, |sum, (utxo, _)| sum + utxo.amount);
         let swap = self
-            .list_incoming_swap_coin_utxo_spend_info(all_utxos)?
+            .list_incoming_swap_coin_utxo_spend_info(None)?
             .iter()
             .fold(Amount::ZERO, |sum, (utxo, _)| sum + utxo.amount);
         let fidelity = self
-            .list_fidelity_spend_info(all_utxos)?
+            .list_fidelity_spend_info(None)?
             .iter()
             .fold(Amount::ZERO, |sum, (utxo, _)| sum + utxo.amount);
         let spendable = regular + swap;
@@ -863,7 +861,7 @@ impl Wallet {
 
     /// Refreshes the offer maximum size cache based on the current wallet's unspent transaction outputs (UTXOs).
     pub(crate) fn refresh_offer_maxsize_cache(&mut self) -> Result<(), WalletError> {
-        let balance = self.get_balances(None)?.spendable;
+        let balance = self.get_balances()?.spendable;
         self.store.offer_maxsize = balance.to_sat();
         Ok(())
     }
