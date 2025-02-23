@@ -4,6 +4,8 @@
 //! The server maintains the thread pool for P2P Connection, Watchtower, Bitcoin Backend and RPC Client Request.
 //! The server listens at two port 6102 for P2P, and 6103 for RPC Client request.
 
+use bitcoin::{absolute::LockTime, Amount};
+use bitcoind::bitcoincore_rpc::RpcApi;
 use std::{
     io::ErrorKind,
     net::{Ipv4Addr, TcpListener, TcpStream},
@@ -13,9 +15,6 @@ use std::{
     thread::{self, sleep},
     time::Duration,
 };
-
-use bitcoin::{absolute::LockTime, Amount};
-use bitcoind::bitcoincore_rpc::RpcApi;
 
 #[cfg(feature = "tor")]
 use socks::Socks5Stream;
@@ -133,6 +132,10 @@ fn network_bootstrap(maker: Arc<Maker>) -> Result<Option<Child>, MakerError> {
         maker_address
     );
 
+    maker
+        .as_ref()
+        .track_and_update_unconfirmed_fidelity_bonds()?;
+
     setup_fidelity_bond(&maker, &maker_address)?;
     log::info!(
         "Max offer size : {} sats",
@@ -242,13 +245,10 @@ fn setup_fidelity_bond(maker: &Arc<Maker>, maker_address: &str) -> Result<(), Ma
             wallet_read.calculate_bond_value(i)?.to_sat()
         );
         log::info!("Bond amount : {:?}", bond.amount.to_sat());
-        // TODO: work remainig
-        // log::info!("")
 
         let mut proof = maker.highest_fidelity_proof.write()?;
         *proof = Some(highest_proof);
     } else {
-        // xxxxx
         // No bond in the wallet. Lets attempt to create one.
         let amount = Amount::from_sat(maker.config.fidelity_amount);
         let current_height = maker
